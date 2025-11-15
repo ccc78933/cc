@@ -1,0 +1,315 @@
+<template>
+  <div class="stack" style="gap:16px; max-width:720px; margin:0 auto;">
+    <div class="title">个人信息</div>
+
+    <div class="card" style="padding:16px;">
+      <div class="row" style="align-items:flex-start; gap:16px;">
+        <div style="width:84px; height:84px; border-radius:50%; overflow:hidden; background: var(--elev); display:flex; align-items:center; justify-content:center;">
+          <img v-if="avatar_url" :src="avatar_url" alt="avatar" style="width:100%; height:100%; object-fit:cover;" />
+          <span v-else style="font-size:28px; font-weight:700;">{{ initial }}</span>
+        </div>
+        <div class="col">
+          <div class="row">
+            <div class="col">
+              <label class="label">姓名</label>
+              <input class="input" v-model="name" placeholder="你的姓名" />
+            </div>
+            <div class="col">
+              <label class="label">头像链接</label>
+              <input class="input" v-model="avatar_url" placeholder="https://.../avatar.jpg" />
+            </div>
+          </div>
+          <div class="row">
+            <div class="col">
+              <label class="label">邮箱</label>
+              <input class="input" :value="email" disabled />
+            </div>
+            <div class="col">
+              <label class="label">用户�?/label>
+              <input class="input" :value="username" disabled />
+            </div>
+          </div>
+
+          <div class="row" style="align-items:flex-start; gap:12px;">
+            <div class="col">
+              <label class="label">上传头像</label>
+              <div class="card"
+                   @dragover.prevent
+                   @drop.prevent="onDrop"
+                   style="position:relative; width:100%; max-width:360px; aspect-ratio:1/1; background: rgba(31,34,44,.5); border:1px dashed var(--border); border-radius:10px; overflow:hidden;">
+                <img v-if="previewUrl" :src="previewUrl" ref="imgEl" @load="onImgLoad" alt="预览" style="width:100%; height:100%; object-fit:contain;" />
+                <div v-else class="muted" style="position:absolute; inset:0; display:flex; align-items:center; justify-content:center;">拖拽图片到此处或点击选择</div>
+                <div v-if="previewUrl" @mousedown.prevent="startDrag" @touchstart.prevent="startDrag" :style="cropStyle"></div>
+                <input ref="fileEl" type="file" accept="image/*" @change="onPick" hidden />
+                <button class="btn" style="position:absolute; right:8px; bottom:8px;" @click="() => fileEl?.click()">选择文件</button>
+              </div>
+              <div v-if="previewUrl" style="display:flex; align-items:center; gap:8px; margin-top:8px;">
+                <span class="muted" style="font-size:12px;">裁切尺寸</span>
+                <input type="range" min="40" max="100" v-model.number="cropPercent" />
+              </div>
+              <div class="muted" style="font-size:12px;">支持 jpg/png/webp，≤ {{ maxMB }}MB</div>
+            </div>
+            <div class="col" style="display:flex; gap:8px; align-items:flex-end;">
+              <button class="btn" @click="doUploadCropped" :disabled="!previewUrl">裁切并上�?/button>
+              <button class="btn" @click="doUpload" :disabled="!file">直接上传原图</button>
+              <button class="btn primary" @click="save">保存</button>
+              <span class="muted" v-if="msg">{{ msg }}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card section" style="padding:16px;">
+      <div class="title">更换密码</div>
+      <div class="divider"></div>
+      <div class="row">
+        <div class="col">
+          <label class="label">旧密�?/label>
+          <input class="input" type="password" v-model="oldPass" placeholder="请输入旧密码" />
+        </div>
+        <div class="col">
+          <label class="label">新密�?/label>
+          <input class="input" type="password" v-model="newPass" placeholder="至少 6 �? />
+        </div>
+      </div>
+      <div class="row">
+        <div class="col">
+          <label class="label">确认新密�?/label>
+          <input class="input" type="password" v-model="newPass2" placeholder="再次输入新密�? />
+        </div>
+        <div class="col" style="display:flex; align-items:flex-end;">
+          <button class="btn primary" :disabled="changing || !oldPass || !newPass || newPass.length<6 || newPass!==newPass2" @click="changePassword">更换密码</button>
+        </div>
+      </div>
+    </div>
+  </div>
+  
+</template>
+
+<script setup>
+import { ref, computed, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { useAppStore } from '../stores/app'
+import { authMe, authProfileUpdate, uploadFile, authChangePassword } from '../services/api'
+
+const store = useAppStore()
+const router = useRouter()
+const email = ref('')
+const username = ref('')
+const name = ref('')
+const avatar_url = ref('')
+const msg = ref('')
+const initial = computed(() => (name.value || username.value || email.value || 'U').toString().trim().charAt(0).toUpperCase())
+const fileEl = ref(null)
+const file = ref(null)
+const previewUrl = ref('')
+const imgEl = ref(null)
+const imgNatural = ref({ w: 0, h: 0 })
+const box = ref({ w: 0, h: 0 })
+const crop = ref({ x: 0, y: 0, s: 0 })
+const dragging = ref(false)
+const dragStart = ref({ x: 0, y: 0, cx: 0, cy: 0 })
+const cropPercent = ref(70)
+const maxMB = 5
+const cropStyle = computed(() => ({
+  position: 'absolute', left: crop.value.x + 'px', top: crop.value.y + 'px', width: crop.value.s + 'px', height: crop.value.s + 'px',
+  border: '2px solid rgba(99,102,241,.9)', boxShadow: '0 0 0 200vmax rgba(0,0,0,.4) inset', borderRadius: '8px', cursor: 'move'
+}))
+
+// Prefill from store/localStorage immediately (then refresh via authMe)
+try {
+  const a = store.auth || {}
+  email.value = a.email || ''
+  username.value = a.username || ''
+  name.value = a.name || ''
+  avatar_url.value = a.avatar_url || ''
+} catch {}
+try {
+  if (!email.value || !username.value) {
+    const la = JSON.parse(localStorage.getItem('auth') || '{}')
+    email.value = email.value || la.email || ''
+    username.value = username.value || la.username || ''
+    name.value = name.value || la.name || ''
+    avatar_url.value = avatar_url.value || la.avatar_url || ''
+  }
+} catch {}
+
+async function load() {
+  try {
+    const me = await authMe()
+    email.value = me.email || ''
+    username.value = me.username || ''
+    name.value = me.name || ''
+    avatar_url.value = me.avatar_url || ''
+    store.updateAuth({ email: email.value, username: username.value, name: name.value, avatar_url: avatar_url.value })
+  } catch (e) { store.addToast({ text: e.message || '获取失败', kind: 'bad' }) }
+}
+
+async function save() {
+  try {
+    const me = await authProfileUpdate({ name: name.value, avatar_url: avatar_url.value })
+    store.updateAuth({ email: me.email, username: me.username, name: me.name, avatar_url: me.avatar_url })
+    msg.value = '已保�?
+    setTimeout(() => (msg.value = ''), 2000)
+  } catch (e) { store.addToast({ text: e.message || '保存失败', kind: 'bad' }) }
+}
+
+function onPick(ev) {
+  const f = ev.target && ev.target.files && ev.target.files[0]
+  if (!f) return
+  handleFile(f)
+}
+
+function onDrop(e) {
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]
+  if (!f) return
+  handleFile(f)
+}
+
+function handleFile(f) {
+  const okType = /image\/(jpeg|png|webp)/i.test(f.type)
+  if (!okType) return store.addToast({ text: '仅支�?jpg/png/webp', kind: 'bad' })
+  if (f.size > maxMB * 1024 * 1024) return store.addToast({ text: `文件过大（超�?${maxMB}MB）`, kind: 'bad' })
+  file.value = f
+  const reader = new FileReader()
+  reader.onload = () => { previewUrl.value = reader.result; setTimeout(initCrop, 0) }
+  reader.readAsDataURL(f)
+}
+
+function onImgLoad() {
+  const img = imgEl.value
+  if (!img) return
+  imgNatural.value = { w: img.naturalWidth, h: img.naturalHeight }
+  const rect = img.getBoundingClientRect()
+  box.value = { w: rect.width, h: rect.height }
+  initCrop()
+}
+
+function initCrop() {
+  const c = Math.min(box.value.w, box.value.h) * (cropPercent.value / 100)
+  crop.value.s = Math.max(40, Math.min(c, Math.min(box.value.w, box.value.h)))
+  crop.value.x = (box.value.w - crop.value.s) / 2
+  crop.value.y = (box.value.h - crop.value.s) / 2
+}
+
+function startDrag(ev) {
+  dragging.value = true
+  const pt = getPoint(ev)
+  dragStart.value = { x: pt.x, y: pt.y, cx: crop.value.x, cy: crop.value.y }
+  window.addEventListener('mousemove', onDrag)
+  window.addEventListener('mouseup', endDrag)
+  window.addEventListener('touchmove', onDrag, { passive: false })
+  window.addEventListener('touchend', endDrag)
+}
+
+function onDrag(ev) {
+  if (!dragging.value) return
+  const pt = getPoint(ev)
+  const dx = pt.x - dragStart.value.x
+  const dy = pt.y - dragStart.value.y
+  const nx = Math.max(0, Math.min(box.value.w - crop.value.s, dragStart.value.cx + dx))
+  const ny = Math.max(0, Math.min(box.value.h - crop.value.s, dragStart.value.cy + dy))
+  crop.value.x = nx
+  crop.value.y = ny
+}
+
+function endDrag() {
+  dragging.value = false
+  window.removeEventListener('mousemove', onDrag)
+  window.removeEventListener('mouseup', endDrag)
+  window.removeEventListener('touchmove', onDrag)
+  window.removeEventListener('touchend', endDrag)
+}
+
+function getPoint(ev) {
+  if (ev.touches && ev.touches[0]) {
+    const t = ev.touches[0]
+    const rect = imgEl.value.getBoundingClientRect()
+    return { x: t.clientX - rect.left, y: t.clientY - rect.top }
+  } else {
+    const rect = imgEl.value.getBoundingClientRect()
+    return { x: ev.clientX - rect.left, y: ev.clientY - rect.top }
+  }
+}
+
+async function doUploadCropped() {
+  if (!previewUrl.value || !imgEl.value) return
+  try {
+    store.startProgress()
+    const img = imgEl.value
+    const scaleX = img.naturalWidth / box.value.w
+    const scaleY = img.naturalHeight / box.value.h
+    const sx = Math.max(0, Math.round(crop.value.x * scaleX))
+    const sy = Math.max(0, Math.round(crop.value.y * scaleY))
+    const sw = Math.min(img.naturalWidth - sx, Math.round(crop.value.s * scaleX))
+    const sh = Math.min(img.naturalHeight - sy, Math.round(crop.value.s * scaleY))
+    const outSize = 512
+    const canvas = document.createElement('canvas')
+    canvas.width = outSize
+    canvas.height = outSize
+    const ctx = canvas.getContext('2d')
+    const tmp = new Image()
+    await new Promise((res) => { tmp.onload = () => res(); tmp.src = previewUrl.value })
+    ctx.drawImage(tmp, sx, sy, sw, sh, 0, 0, outSize, outSize)
+    const blob = await new Promise((res) => canvas.toBlob(res, 'image/jpeg', 0.92))
+    const f = new File([blob], 'avatar.jpg', { type: 'image/jpeg' })
+    const res = await uploadFile(f, 'avatars')
+    const url = res?.public_url || res?.url || ''
+    if (url) {
+      avatar_url.value = url
+      store.addToast({ text: '上传成功（裁切）', kind: 'good' })
+    } else {
+      store.addToast({ text: '上传失败', kind: 'bad' })
+    }
+  } catch (e) {
+    store.addToast({ text: e.message || '上传失败', kind: 'bad' })
+  } finally {
+    store.finishProgress()
+  }
+}
+
+async function doUpload() {
+  if (!file.value) return
+  try {
+    store.startProgress()
+    const res = await uploadFile(file.value, 'avatars')
+    const url = res?.public_url || res?.url || ''
+    if (url) {
+      avatar_url.value = url
+      store.addToast({ text: '上传成功', kind: 'good' })
+    } else {
+      store.addToast({ text: '上传失败', kind: 'bad' })
+    }
+  } catch (e) {
+    store.addToast({ text: e.message || '上传失败', kind: 'bad' })
+  } finally {
+    store.finishProgress()
+    if (fileEl.value) fileEl.value.value = ''
+    file.value = null
+  }
+}
+
+// 更换密码
+const oldPass = ref('')
+const newPass = ref('')
+const newPass2 = ref('')
+const changing = ref(false)
+
+async function changePassword() {
+  if (!oldPass.value || !newPass.value || newPass.value.length < 6 || newPass.value !== newPass2.value) return
+  try {
+    changing.value = true
+    await authChangePassword(oldPass.value, newPass.value)
+    store.addToast({ text: '密码已更新，请重新登�?, kind: 'good' })
+    try { localStorage.removeItem('auth') } catch {}
+    router.replace('/login')
+  } catch (e) {
+    store.addToast({ text: e.message || '更换密码失败', kind: 'bad' })
+  } finally {
+    changing.value = false
+  }
+}
+
+onMounted(() => { load() })
+</script>

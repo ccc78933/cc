@@ -1,0 +1,24 @@
+# Flask web framework
+Flask>=2.3.0
+flask-cors>=4.0.0
+
+# Image processing
+Pillow>=10.0.0
+
+# Database drivers
+pymysql>=1.1.0
+cryptography>=41.0.0  # Required for MySQL 8.0+ authentication (caching_sha2_password)
+
+# JWT (if using PyJWT)
+PyJWT>=2.8.0
+
+# HTTP requests for AI API
+requests>=2.31.0
+
+# Deep Learning (PyTorch)
+torch>=2.0.0
+torchvision>=0.15.0
+
+# Email (optional, for SMTP)
+# No additional packages needed, uses built-in smtplib
+

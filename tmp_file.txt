@@ -1,0 +1,606 @@
+import os
+from typing import Any, Dict, Optional, Tuple
+
+from ..config import load_config
+
+CFG = load_config()
+
+_auth_db_url = (CFG.auth_db_url or '').strip() or CFG.db_url
+_mode = 'mysql' if _auth_db_url.startswith('mysql://') or _auth_db_url.startswith('mysql+pymysql://') else 'sqlite'
+
+# Lazy singletons
+_mysql_conn = None
+_mysql_json_type = 'JSON'
+
+try:
+    import pymysql  # type: ignore
+    from pymysql import OperationalError, InterfaceError  # type: ignore
+except Exception:
+    pymysql = None  # type: ignore
+    OperationalError = Exception  # type: ignore
+    InterfaceError = Exception  # type: ignore
+
+
+def _ensure_mysql_conn():
+    global _mysql_conn
+    if _mysql_conn is not None:
+        # Ensure the existing connection is alive; reconnect if needed
+        try:
+            _mysql_conn.ping(reconnect=True)
+            return _mysql_conn
+        except Exception:
+            _mysql_conn = None
+    try:
+        import pymysql  # type: ignore
+        from urllib.parse import urlparse
+        url = _auth_db_url.replace('mysql+pymysql://', 'mysql://')
+        u = urlparse(url)
+        user = u.username or 'root'
+        password = u.password or ''
+        host = u.hostname or '127.0.0.1'
+        port = u.port or 3306
+        db = (u.path or '/cc').lstrip('/') or 'cc'
+        _mysql_conn = pymysql.connect(
+            host=host,
+            port=port,
+            user=user,
+            password=password,
+            database=db,
+            charset='utf8mb4',
+            autocommit=True,
+            connect_timeout=5,
+            read_timeout=15,
+            write_timeout=15,
+        )
+        _ensure_mysql_tables(_mysql_conn)
+        return _mysql_conn
+    except Exception as e:
+        raise RuntimeError(f"MySQL connect failed: {e}")
+
+
+def _detect_mysql_json_type(conn) -> str:
+    """Detect whether current MySQL/MariaDB supports JSON type; fallback to LONGTEXT."""
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT CAST('{\\"a\\":1}' AS JSON)")
+        return 'JSON'
+    except Exception:
+        return 'LONGTEXT'
+
+
+def _ensure_mysql_tables(conn):
+    global _mysql_json_type
+    # Determine JSON compatibility once
+    try:
+        _mysql_json_type = _detect_mysql_json_type(conn)
+    except Exception:
+        _mysql_json_type = 'LONGTEXT'
+    JT = _mysql_json_type
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS users (
+              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+              email VARCHAR(255) NOT NULL,
+              username VARCHAR(191) NULL,
+              name VARCHAR(255) NULL,
+              avatar_url VARCHAR(512) NULL,
+              password_hash CHAR(64) NOT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (id),
+              UNIQUE KEY uk_users_email (email),
+              UNIQUE KEY uk_users_username (username)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS email_code (
+              email VARCHAR(255) NOT NULL,
+              code VARCHAR(16) NOT NULL,
+              expires_at BIGINT NOT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (email)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS profile (
+              uid VARCHAR(191) NOT NULL,
+              height_cm DECIMAL(6,2) NULL,
+              weight_kg DECIMAL(6,2) NULL,
+              age INT NULL,
+              gender VARCHAR(32) NULL,
+              updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+              PRIMARY KEY (uid)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS feedback (
+              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+              uid VARCHAR(191) NULL,
+              text TEXT NOT NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (id),
+              KEY idx_feedback_uid (uid)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS history (
+              id BIGINT NOT NULL,
+              user_id VARCHAR(255) NULL,
+              dish VARCHAR(255) NOT NULL,
+              score DOUBLE NULL,
+              topk {JT} NULL,
+              nutrition {JT} NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              thumb_url VARCHAR(512) NULL,
+              meta {JT} NULL,
+              PRIMARY KEY (id),
+              KEY idx_history_user (user_id),
+              KEY idx_history_created (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """.format(JT=JT)
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS favorite (
+              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+              user_id VARCHAR(255) NULL,
+              dish VARCHAR(255) NOT NULL,
+              nutrition {JT} NULL,
+              note VARCHAR(512) NULL,
+              created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+              PRIMARY KEY (id),
+              KEY idx_favorite_user (user_id),
+              KEY idx_favorite_created (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """.format(JT=JT)
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS food_nutrition (
+              id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+              name_std VARCHAR(255) NOT NULL,
+              alias {JT} NULL,
+              basis VARCHAR(32) NOT NULL DEFAULT 'per_serving',
+              serving_size_g INT NULL,
+              calories DOUBLE NULL,
+              protein DOUBLE NULL,
+              fat DOUBLE NULL,
+              carbs DOUBLE NULL,
+              sodium DOUBLE NULL,
+              fiber DOUBLE NULL,
+              sugar DOUBLE NULL,
+              vitamins {JT} NULL,
+              allergens {JT} NULL,
+              tags {JT} NULL,
+              PRIMARY KEY (id),
+              UNIQUE KEY uk_food_nutrition_name (name_std)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+            """.format(JT=JT)
+        )
+
+
+# SQLite delegates
+def _sqlite_conn():
+    from .db import get_conn
+    return get_conn(CFG.db_url)
+
+
+def ping() -> bool:
+    """Return True if auth DB is reachable."""
+    try:
+        if _mode == 'sqlite':
+            conn = _sqlite_conn()
+            conn.execute("SELECT 1")
+            return True
+        conn = _ensure_mysql_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
+
+
+def count_users() -> int:
+    """Return total users in auth store (dev/diagnostics only)."""
+    try:
+        if _mode == 'sqlite':
+            conn = _sqlite_conn()
+            cur = conn.execute("SELECT COUNT(1) FROM users")
+            return int(cur.fetchone()[0])
+        conn = _ensure_mysql_conn()
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(1) FROM users")
+            r = cur.fetchone()
+            return int(r[0]) if r else 0
+    except Exception:
+        return -1
+
+
+def get_user_by_email(_conn, email: str) -> Optional[Dict[str, Any]]:
+    if _mode == 'sqlite':
+        from .db import get_user_by_email as _g
+        return _g(_sqlite_conn(), email)
+    # Try once, then reconnect and retry on transient connection errors
+    attempts = 2
+    last_err = None
+    for _ in range(attempts):
+        try:
+            conn = _ensure_mysql_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT id,email,username,name,avatar_url,password_hash,created_at FROM users WHERE email=%s", (email,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                id_, email, username, name, avatar_url, ph, created_at = row
+                return {'id': id_, 'email': email, 'username': username, 'name': name, 'avatar_url': avatar_url, 'password_hash': ph, 'created_at': str(created_at)}
+        except (OperationalError, InterfaceError) as e:  # type: ignore
+            last_err = e
+            # force reconnect on next loop
+            global _mysql_conn
+            _mysql_conn = None
+            continue
+    # fallthrough
+    raise RuntimeError(f"mysql query failed: {last_err}")
+
+
+def get_user_by_username(_conn, username: str) -> Optional[Dict[str, Any]]:
+    if _mode == 'sqlite':
+        from .db import get_user_by_username as _g
+        return _g(_sqlite_conn(), username)
+    attempts = 2
+    last_err = None
+    for _ in range(attempts):
+        try:
+            conn = _ensure_mysql_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT id,email,username,name,avatar_url,password_hash,created_at FROM users WHERE username=%s", (username,))
+                row = cur.fetchone()
+                if not row:
+                    return None
+                id_, email, username, name, avatar_url, ph, created_at = row
+                return {'id': id_, 'email': email, 'username': username, 'name': name, 'avatar_url': avatar_url, 'password_hash': ph, 'created_at': str(created_at)}
+        except (OperationalError, InterfaceError) as e:  # type: ignore
+            last_err = e
+            global _mysql_conn
+            _mysql_conn = None
+            continue
+    raise RuntimeError(f"mysql query failed: {last_err}")
+
+
+def list_users(_conn, limit: int = 100) -> list:
+    """List users (id, email, username, name, created_at)."""
+    if _mode == 'sqlite':
+        conn = _sqlite_conn()
+        cur = conn.execute("SELECT id,email,username,name,created_at FROM users ORDER BY id DESC LIMIT ?", (limit,))
+        rows = cur.fetchall()
+        return [
+            {
+                'id': r[0], 'email': r[1], 'username': r[2] if len(r) > 2 else None,
+                'name': r[3] if len(r) > 3 else None, 'created_at': r[4] if len(r) > 4 else None
+            }
+            for r in rows
+        ]
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id,email,username,name,created_at FROM users ORDER BY id DESC LIMIT %s", (int(limit),))
+        rows = cur.fetchall()
+        out = []
+        for r in rows:
+            id_, email, username, name, created_at = r
+            out.append({'id': id_, 'email': email, 'username': username, 'name': name, 'created_at': str(created_at)})
+        return out
+
+
+def create_user(_conn, email: str, password_hash: str, username: Optional[str] = None, name: Optional[str] = None) -> int:
+    if _mode == 'sqlite':
+        from .db import create_user as _c
+        return _c(_sqlite_conn(), email, password_hash, username=username, name=name)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        try:
+            cur.execute(
+                "INSERT INTO users (email, username, name, password_hash, created_at) VALUES (%s,%s,%s,%s,CURRENT_TIMESTAMP)",
+                (email, username, name, password_hash)
+            )
+            return cur.lastrowid or 0
+        except Exception:
+            # duplicate -> fetch id
+            cur.execute("SELECT id FROM users WHERE email=%s", (email,))
+            r = cur.fetchone()
+            return r[0] if r else 0
+
+
+def update_user_account(_conn, email: str, *, password_hash: Optional[str] = None, name: Optional[str] = None, username: Optional[str] = None) -> Tuple[bool, Optional[str]]:
+    if _mode == 'sqlite':
+        from .db import update_user_account as _u
+        return _u(_sqlite_conn(), email, password_hash=password_hash, name=name, username=username)
+    conn = _ensure_mysql_conn()
+    sets = []
+    params = []
+    if password_hash is not None:
+        sets.append('password_hash=%s'); params.append(password_hash)
+    if name is not None:
+        sets.append('name=%s'); params.append(name)
+    if username is not None:
+        sets.append('username=%s'); params.append(username)
+    if not sets:
+        return True, None
+    params.append(email)
+    sql = f"UPDATE users SET {', '.join(sets)} WHERE email=%s"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+        return True, None
+    except Exception as e:
+        msg = str(e)
+        if 'Duplicate entry' in msg and 'uk_users_username' in msg:
+            return False, 'username exists'
+        return False, msg
+
+
+def set_email_code(_conn, email: str, code: str, expires_at: int):
+    if _mode == 'sqlite':
+        from .db import set_email_code as _s
+        return _s(_sqlite_conn(), email, code, expires_at)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO email_code (email, code, expires_at, created_at) VALUES (%s,%s,%s,CURRENT_TIMESTAMP) "
+            "ON DUPLICATE KEY UPDATE code=VALUES(code), expires_at=VALUES(expires_at), created_at=CURRENT_TIMESTAMP",
+            (email, code, expires_at)
+        )
+
+
+def verify_email_code(_conn, email: str, code: str) -> bool:
+    if _mode == 'sqlite':
+        from .db import verify_email_code as _v
+        return _v(_sqlite_conn(), email, code)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT code, expires_at FROM email_code WHERE email=%s", (email,))
+        row = cur.fetchone()
+        if not row:
+            return False
+        c, exp = row
+        try:
+            import time as _t
+            if int(exp or 0) < int(_t.time()):
+                return False
+        except Exception:
+            return False
+        return (c or '') == code
+
+
+def get_email_code(_conn, email: str) -> Optional[Dict[str, Any]]:
+    if _mode == 'sqlite':
+        from .db import get_email_code as _g
+        return _g(_sqlite_conn(), email)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT email, code, expires_at, created_at FROM email_code WHERE email=%s", (email,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        e, c, exp, created = row
+        return {'email': e, 'code': c, 'expires_at': int(exp), 'created_at': str(created)}
+
+
+def update_user_profile(_conn, email: str, *, name: Optional[str] = None, avatar_url: Optional[str] = None):
+    if _mode == 'sqlite':
+        from .db import update_user_profile as _u
+        return _u(_sqlite_conn(), email, name=name, avatar_url=avatar_url)
+    conn = _ensure_mysql_conn()
+    sets = []
+    params = []
+    if name is not None:
+        sets.append('name=%s'); params.append(name)
+    if avatar_url is not None:
+        sets.append('avatar_url=%s'); params.append(avatar_url)
+    if not sets:
+        return
+    params.append(email)
+    sql = f"UPDATE users SET {', '.join(sets)} WHERE email=%s"
+    with conn.cursor() as cur:
+        cur.execute(sql, tuple(params))
+
+
+def upsert_profile(_conn, item: Dict[str, Any]):
+    """Create or update profile by uid."""
+    if _mode == 'sqlite':
+        from .db import upsert_profile as _u
+        return _u(_sqlite_conn(), item)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO profile (uid, height_cm, weight_kg, age, gender, updated_at) "
+            "VALUES (%s,%s,%s,%s,%s,COALESCE(%s, CURRENT_TIMESTAMP)) "
+            "ON DUPLICATE KEY UPDATE height_cm=VALUES(height_cm), weight_kg=VALUES(weight_kg), age=VALUES(age), gender=VALUES(gender), updated_at=VALUES(updated_at)",
+            (
+                item.get('uid'), item.get('height_cm'), item.get('weight_kg'), item.get('age'), item.get('gender'), item.get('updated_at')
+            )
+        )
+
+
+def insert_feedback(_conn, item: Dict[str, Any]) -> int:
+    if _mode == 'sqlite':
+        from .db import insert_feedback as _i
+        return _i(_sqlite_conn(), item)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO feedback (uid, text, created_at) VALUES (%s,%s,COALESCE(%s, CURRENT_TIMESTAMP))",
+            (item.get('uid'), item.get('text'), item.get('created_at'))
+        )
+        return cur.lastrowid or 0
+
+
+# History APIs
+def insert_history(_conn, item: Dict[str, Any]):
+    if _mode == 'sqlite':
+        from .db import insert_history as _i
+        return _i(_sqlite_conn(), item)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO history (id, user_id, dish, score, topk, nutrition, created_at, thumb_url, meta) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON DUPLICATE KEY UPDATE user_id=VALUES(user_id), dish=VALUES(dish), score=VALUES(score), topk=VALUES(topk), nutrition=VALUES(nutrition), created_at=VALUES(created_at), thumb_url=VALUES(thumb_url), meta=VALUES(meta)",
+            (
+                int(item['id']), item.get('user_id'), item.get('dish'), float(item.get('score') or 0.0),
+                json_dumps(item.get('topk') or []), json_dumps(item.get('nutrition') or {}), item.get('created_at'),
+                item.get('thumb_url'), json_dumps(item.get('meta') or {})
+            )
+        )
+
+
+def list_history(_conn, page: int, page_size: int):
+    if _mode == 'sqlite':
+        from .db import list_history as _l
+        return _l(_sqlite_conn(), page, page_size)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM history")
+        total = int(cur.fetchone()[0])
+        offset = (page - 1) * page_size
+        cur.execute("SELECT id,dish,score,topk,nutrition,created_at,thumb_url,meta FROM history ORDER BY created_at DESC LIMIT %s OFFSET %s", (page_size, offset))
+        items = []
+        for (id_, dish, score, topk, nutrition, created_at, thumb, meta) in cur.fetchall():
+            items.append({'id': id_, 'dish': dish, 'label': dish, 'score': float(score or 0), 'topk': parse_json(topk, []), 'nutrition': parse_json(nutrition, {}), 'time': str(created_at), 'thumb_url': thumb, 'meta': parse_json(meta, {})})
+        return items, total
+
+
+def list_history_user(_conn, user_id: str, page: int, page_size: int):
+    if _mode == 'sqlite':
+        from .db import list_history_user as _l
+        return _l(_sqlite_conn(), user_id, page, page_size)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM history WHERE user_id=%s", (user_id,))
+        total = int(cur.fetchone()[0])
+        offset = (page - 1) * page_size
+        cur.execute("SELECT id,dish,score,topk,nutrition,created_at,thumb_url,meta FROM history WHERE user_id=%s ORDER BY created_at DESC LIMIT %s OFFSET %s", (user_id, page_size, offset))
+        items = []
+        for (id_, dish, score, topk, nutrition, created_at, thumb, meta) in cur.fetchall():
+            items.append({'id': id_, 'dish': dish, 'label': dish, 'score': float(score or 0), 'topk': parse_json(topk, []), 'nutrition': parse_json(nutrition, {}), 'time': str(created_at), 'thumb_url': thumb, 'meta': parse_json(meta, {})})
+        return items, total
+
+
+def clear_history(_conn):
+    if _mode == 'sqlite':
+        from .db import clear_history as _c
+        return _c(_sqlite_conn())
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM history")
+
+
+def delete_history(_conn, item_id: int):
+    if _mode == 'sqlite':
+        from .db import delete_history as _d
+        return _d(_sqlite_conn(), item_id)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("DELETE FROM history WHERE id=%s", (item_id,))
+
+
+# Favorite APIs
+def list_favorite(_conn):
+    if _mode == 'sqlite':
+        from .db import list_favorite as _l
+        return _l(_sqlite_conn())
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id,user_id,dish,nutrition,note,created_at FROM favorite ORDER BY created_at DESC")
+        items = []
+        for (id_, uid, dish, nutrition, note, created_at) in cur.fetchall():
+            items.append({'id': id_, 'user_id': uid, 'dish': dish, 'nutrition': parse_json(nutrition, {}), 'note': note, 'created_at': str(created_at)})
+        return items
+
+
+def list_favorite_user(_conn, user_id: str):
+    if _mode == 'sqlite':
+        from .db import list_favorite_user as _l
+        return _l(_sqlite_conn(), user_id)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute("SELECT id,user_id,dish,nutrition,note,created_at FROM favorite WHERE user_id=%s ORDER BY created_at DESC", (user_id,))
+        items = []
+        for (id_, uid, dish, nutrition, note, created_at) in cur.fetchall():
+            items.append({'id': id_, 'user_id': uid, 'dish': dish, 'nutrition': parse_json(nutrition, {}), 'note': note, 'created_at': str(created_at)})
+        return items
+
+
+def insert_favorite(_conn, item: Dict[str, Any]) -> int:
+    if _mode == 'sqlite':
+        from .db import insert_favorite as _i
+        return _i(_sqlite_conn(), item)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO favorite (user_id, dish, nutrition, note, created_at) VALUES (%s,%s,%s,%s,COALESCE(%s, CURRENT_TIMESTAMP))",
+            (item.get('user_id'), item.get('dish'), json_dumps(item.get('nutrition') or {}), item.get('note'), item.get('created_at'))
+        )
+        return cur.lastrowid or 0
+
+
+# helpers
+import json as _json
+def json_dumps(obj):
+    try:
+        return _json.dumps(obj, ensure_ascii=False)
+    except Exception:
+        return None
+
+def parse_json(val, default):
+    try:
+        if val is None:
+            return default
+        if isinstance(val, (bytes, bytearray)):
+            val = val.decode('utf-8', errors='ignore')
+        if isinstance(val, (str,)):
+            return _json.loads(val)
+        # Some drivers may return native dict/list for JSON
+        return val
+    except Exception:
+        return default
+
+
+# Nutrition APIs
+def find_food(_conn, name: str) -> Optional[Dict[str, Any]]:
+    if _mode == 'sqlite':
+        from .db import find_food as _f
+        return _f(_sqlite_conn(), name)
+    conn = _ensure_mysql_conn()
+    with conn.cursor() as cur:
+        # Try direct match
+        cur.execute("SELECT name_std, alias, basis, serving_size_g, calories, protein, fat, carbs, sodium, fiber, sugar, vitamins, allergens, tags FROM food_nutrition WHERE name_std=%s", (name,))
+        r = cur.fetchone()
+        if r:
+            keys = ['name_std','alias','basis','serving_size_g','calories','protein','fat','carbs','sodium','fiber','sugar','vitamins','allergens','tags']
+            row = dict(zip(keys, r))
+            return row
+        # Fallback alias contains
+        try:
+            cur.execute("SELECT name_std, alias, basis, serving_size_g, calories, protein, fat, carbs, sodium, fiber, sugar, vitamins, allergens, tags FROM food_nutrition WHERE JSON_CONTAINS(alias, JSON_QUOTE(%s))", (name,))
+            r = cur.fetchone()
+            if r:
+                keys = ['name_std','alias','basis','serving_size_g','calories','protein','fat','carbs','sodium','fiber','sugar','vitamins','allergens','tags']
+                return dict(zip(keys, r))
+        except Exception:
+            # If JSON_CONTAINS not available, scan
+            cur.execute("SELECT name_std, alias, basis, serving_size_g, calories, protein, fat, carbs, sodium, fiber, sugar, vitamins, allergens, tags FROM food_nutrition")
+            for r in cur.fetchall():
+                keys = ['name_std','alias','basis','serving_size_g','calories','protein','fat','carbs','sodium','fiber','sugar','vitamins','allergens','tags']
+                row = dict(zip(keys, r))
+                alias = parse_json(row.get('alias'), [])
+                if name in (alias or []):
+                    return row
+        return None
+
